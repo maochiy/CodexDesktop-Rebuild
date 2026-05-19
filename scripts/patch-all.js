@@ -19,6 +19,7 @@ const PATCHES = [
   "patch-plugin-auth.js",
   "patch-updater.js",
   "patch-archive-delete.js",
+  "patch-model-picker.js",
 ];
 
 function main() {
