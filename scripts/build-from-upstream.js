@@ -145,7 +145,16 @@ function buildMac(platform) {
 
   const resourcesDir = path.join(outApp, "Contents", "Resources");
 
-  // 3. Repack patched ASAR
+  // 3. Apply patches to _asar contents
+  console.log("   [patch] applying patches to _asar contents...");
+  try {
+    execSync(`node "${path.join(PROJECT_ROOT, "scripts", "patch-all.js")}" ${platform}`, { stdio: "inherit" });
+  } catch (e) {
+    console.error(`[x] patch-all failed: ${e.message}`);
+    process.exit(1);
+  }
+
+  // 4. Repack patched ASAR
   const asarPath = path.join(resourcesDir, "app.asar");
   console.log("   [asar pack] _asar/ -> app.asar");
   execSync(`npx asar pack "${asarDir}" "${asarPath}"`);
@@ -217,6 +226,15 @@ function buildWin(platform) {
   const asarPath = path.join(resourcesDir, "app.asar");
   const oldHash = computeAsarHeaderHash(asarPath);
   console.log(`   [integrity] old hash: ${oldHash.slice(0, 16)}...`);
+
+  // Apply patches to _asar contents
+  console.log("   [patch] applying patches to _asar contents...");
+  try {
+    execSync(`node "${path.join(PROJECT_ROOT, "scripts", "patch-all.js")}" ${platform}`, { stdio: "inherit" });
+  } catch (e) {
+    console.error(`[x] patch-all failed: ${e.message}`);
+    process.exit(1);
+  }
 
   // Repack patched ASAR
   console.log("   [asar pack] _asar/ -> app.asar");
