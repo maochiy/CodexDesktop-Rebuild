@@ -4,50 +4,55 @@
  *
  * The Codex Desktop model picker is blocked by three mechanisms:
  * 1. Auth gate: Model picker UI only renders when authMethod === "chatgpt"
- *    API-key / custom-provider users never see the picker dropdown.
- * 2. Feature gate: gate `770526561` (remote_models) controls whether
- *    custom/remote model providers are recognized as valid.
- * 3. Allowlist filter: The frontend filters the model list to only include
- *    models from the OpenAI allowlist, removing custom provider models.
+ *    In the minified code, authMethod is destructured from Gc() then
+ *    checked as `r!==`chatgpt`` — if not chatgpt, returns null (no picker).
+ * 2. Allowlist filter: `shouldUseAvailabilityAllowlist` forces only OpenAI
+ *    catalog models to appear; custom models from config.toml are excluded.
+ * 3. Hidden filter: `!e.hidden` excludes "hidden" models from the list.
  *
  * This patch:
  * Rule 1 — Remove authMethod gate for model picker rendering
- *   AST match: BinaryExpression `X.authMethod !== "chatgpt"` inside
- *   functions that also reference model-related strings (modelId, model_picker, etc.)
- *   Replace with !1 (always false = auth gate removed, picker always visible)
+ *   Match: BinaryExpression `X !== "chatgpt"` (Literal or TemplateLiteral)
+ *   inside functions that reference `authMethod` (destructured or dotted).
+ *   Replace with !1 (always false = auth gate never triggers)
+ *   Effect: `if(r!==`chatgpt`)return null` → `if(!1)return null` → never null
  *
- * Rule 2 — Bypass remote_models gate (770526561)
- *   AST match: CallExpression `identifier("770526561")` anywhere
- *   Replace with !0 (always true = remote/custom models enabled)
+ * Rule 2 — Force shouldUseAvailabilityAllowlist to false
+ *   Match: LogicalExpression `X.useHiddenModels && Y !== `amazonBedrock``
+ *   inside model-queries chunks.
+ *   Replace with !1 (always false = allowlist never applied)
+ *   Effect: filter `d?a.has(e.model):!e.hidden` always uses `!e.hidden` branch
  *
- * Rule 3 — Remove model allowlist filter
- *   AST match: .filter() calls on model arrays that contain an
- *   .includes() check (allowlist pattern) inside model picker functions
- *   Replace filter callback with ()=>!0 (all models pass)
+ * Rule 3 — Force !e.hidden to !0 inside model forEach callbacks
+ *   Match: UnaryExpression `!X.hidden` in chunks with `availableModels`
+ *   Replace with !0 (always true = show ALL models including "hidden" ones)
  *
- * Note: Dynamic Config gate `107580212` (model_catalog) is NOT bypassed
- * because it returns a JSON object, not a boolean. Replacing it with !0
- * would break the model catalog data structure. Instead, the allowlist
- * filter removal (Rule 3) ensures custom models appear alongside
- * OpenAI models from the catalog.
+ * Note: Statsig gate `770526561` (remote_models) is NOT explicitly checked
+ * via ec() in the webview code — it only appears in a config mapping.
+ * The allowlist bypass (Rule 2) + hidden bypass (Rule 3) ensure custom
+ * models appear regardless of this gate's server-side value.
+ *
+ * Note: Dynamic Config `107580212` (model_catalog) is NOT bypassed because
+ * it returns a JSON object. Rules 2+3 ensure custom models from config.toml
+ * appear alongside OpenAI models from the catalog.
  */
 const fs = require("fs");
 const path = require("path");
 const { parse } = require("acorn");
 const { SRC_DIR, relPath } = require("./patch-util");
 
-function walk(node, visitor) {
+function walk(node, visitor, parent = null) {
   if (!node || typeof node !== "object") return;
-  if (node.type) visitor(node);
+  if (node.type) visitor(node, parent);
   for (const key of Object.keys(node)) {
     if (key === "type" || key === "start" || key === "end") continue;
     const child = node[key];
     if (Array.isArray(child)) {
       for (const item of child) {
-        if (item && typeof item === "object" && item.type) walk(item, visitor);
+        if (item && typeof item === "object" && item.type) walk(item, visitor, node);
       }
     } else if (child && typeof child === "object" && child.type) {
-      walk(child, visitor);
+      walk(child, visitor, node);
     }
   }
 }
@@ -64,21 +69,40 @@ function getLiteralValue(node) {
   return null;
 }
 
-// ── Rule 1: Remove authMethod gate for model picker ──
-// Same pattern as patch-fast-mode.js, but targeting model picker functions.
+// ── Rule 1: Remove authMethod !== "chatgpt" component gating ──
+// Target pattern: if(authMethod!==`chatgpt`)return null
+// This is a React component gate — renders nothing when auth isn't chatgpt.
+// Only patch when the !== check is the test of an if-return-null pattern,
+// not other authMethod !== chatgpt checks (cloud access, fast mode, etc.)
 
-const MODEL_STRINGS = [
-  "model_picker", "modelPicker", "ModelPicker",
-  "modelId", "model_id", "selectedModel",
-  "modelSelect", "modelDropdown", "model_catalog",
-  "availableModels", "available_models",
-];
+function isIfReturnNull(exprNode, parentNode, source) {
+  // Check: exprNode is the test of an IfStatement whose consequent
+  // is a ReturnStatement returning null
+  if (!parentNode || parentNode.type !== "IfStatement") return false;
+  if (parentNode.test !== exprNode) return false;
+  const cons = parentNode.consequent;
+  if (cons.type === "ReturnStatement") {
+    const arg = cons.argument;
+    if (arg?.type === "Literal" && arg.value === null) return true;
+    if (arg === null) return true; // bare `return;`
+  }
+  // Also handle: if(X!==`chatgpt`)return null — consequent might be
+  // a BlockStatement containing a ReturnStatement
+  if (cons.type === "BlockStatement" && cons.body.length === 1) {
+    const stmt = cons.body[0];
+    if (stmt.type === "ReturnStatement") {
+      const arg = stmt.argument;
+      if (arg?.type === "Literal" && arg.value === null) return true;
+      if (arg === null) return true;
+    }
+  }
+  return false;
+}
 
 function findModelAuthPatches(ast, source) {
   const patches = [];
 
   walk(ast, (node) => {
-    // Match function bodies containing both authMethod and model references
     const isFn =
       node.type === "FunctionDeclaration" ||
       node.type === "FunctionExpression" ||
@@ -88,27 +112,16 @@ function findModelAuthPatches(ast, source) {
     const fnSrc = source.slice(node.start, node.end);
     if (!fnSrc.includes("authMethod")) return;
 
-    // Must contain at least one model-related string
-    let hasModelContext = false;
-    for (const ms of MODEL_STRINGS) {
-      if (fnSrc.includes(ms)) {
-        hasModelContext = true;
-        break;
-      }
-    }
-    if (!hasModelContext) return;
-
-    // Inside this function, find: X.authMethod !== "chatgpt"
-    walk(node, (child) => {
+    walk(node, (child, parent) => {
       if (child.type !== "BinaryExpression" || child.operator !== "!==") return;
 
+      const rightVal = getLiteralValue(child.right);
+      if (rightVal !== "chatgpt") return;
+
+      if (!isIfReturnNull(child, parent, source)) return;
+
       const childSrc = source.slice(child.start, child.end);
-      if (!childSrc.includes("authMethod") || !childSrc.includes("chatgpt"))
-        return;
-
       if (childSrc === "!1") return;
-
-      // Avoid duplicate patches at same offset
       if (patches.some((p) => p.start === child.start)) return;
 
       patches.push({
@@ -124,135 +137,74 @@ function findModelAuthPatches(ast, source) {
   return patches;
 }
 
-// ── Rule 2: Bypass remote_models gate ──
-// gate 770526561 → remote_models (Feature Gate, returns boolean)
-// Replace the call with !0 (always enabled)
+// ── Rule 2: Force shouldUseAvailabilityAllowlist to false ──
+// Match: X.useHiddenModels && Y !== `amazonBedrock`
+// This controls whether the model allowlist is applied.
+// Replace with !1 so allowlist is never used.
 
-const REMOTE_MODELS_GATE_ID = "770526561";
-
-function findRemoteModelsGatePatches(ast, source) {
+function findAllowlistTogglePatches(ast, source) {
   const patches = [];
 
   walk(ast, (node) => {
-    if (node.type !== "CallExpression") return;
-    if (node.callee?.type !== "Identifier") return;
-    if (node.arguments?.length !== 1) return;
+    if (node.type !== "LogicalExpression" || node.operator !== "&&") return;
 
-    const argVal = getLiteralValue(node.arguments[0]);
-    if (argVal !== REMOTE_MODELS_GATE_ID) return;
+    const exprSrc = source.slice(node.start, node.end);
 
-    const expr = source.slice(node.start, node.end);
-    if (expr === "!0") return;
+    // Must contain useHiddenModels on the left side
+    if (!exprSrc.includes("useHiddenModels")) return;
+    // Must contain amazonBedrock on the right side
+    if (!exprSrc.includes("amazonBedrock")) return;
+
+    // Already patched
+    if (exprSrc === "!1") return;
+
+    // Avoid duplicate
+    if (patches.some((p) => p.start === node.start)) return;
 
     patches.push({
-      id: "remote_models_gate",
+      id: "allowlist_toggle_off",
       start: node.start,
       end: node.end,
-      replacement: "!0",
-      original: expr,
+      replacement: "!1",
+      original: exprSrc,
     });
   });
 
   return patches;
 }
 
-// ── Rule 3: Remove model allowlist filter ──
-// Find .filter() calls in model picker context where the callback
-// contains an .includes() check (the allowlist pattern), and replace
-// the entire filter callback with ()=>!0.
+// ── Rule 3: Force !e.hidden to !0 in model forEach ──
+// In the model listing forEach callback: `if(d?a.has(e.model):!e.hidden)`
+// When Rule 2 makes d=!1, the condition becomes `if(!1?a.has(e.model):!e.hidden)`
+// which simplifies to `if(!e.hidden)`. We force !e.hidden → !0 to show ALL models.
 
-function findModelFilterPatches(ast, source) {
+function findHiddenModelPatches(ast, source) {
   const patches = [];
 
-  // Step 1: Find functions that contain model-related context
-  const modelFunctions = [];
+  // Only target chunks that contain the model catalog pattern
+  if (!source.includes("availableModels") && !source.includes("useHiddenModels")) return [];
+
   walk(ast, (node) => {
-    const isFn =
-      node.type === "FunctionDeclaration" ||
-      node.type === "FunctionExpression" ||
-      node.type === "ArrowFunctionExpression";
-    if (!isFn) return;
+    // Match: !X.hidden or !X[Y].hidden
+    if (node.type !== "UnaryExpression" || node.operator !== "!") return;
 
-    const fnSrc = source.slice(node.start, node.end);
-    let hasModelContext = false;
-    for (const ms of MODEL_STRINGS) {
-      if (fnSrc.includes(ms)) {
-        hasModelContext = true;
-        break;
-      }
-    }
-    // Also match if function contains "model_catalog" or model list patterns
-    if (
-      fnSrc.includes("model_catalog") ||
-      fnSrc.includes("modelCatalog") ||
-      fnSrc.includes("models") && fnSrc.includes("filter")
-    ) {
-      hasModelContext = true;
-    }
+    const exprSrc = source.slice(node.start, node.end);
 
-    if (hasModelContext) modelFunctions.push(node);
-  });
+    // Must be !X.hidden pattern
+    if (!exprSrc.includes(".hidden")) return;
 
-  // Step 2: In model functions, find .filter() calls with .includes() callback
-  for (const fn of modelFunctions) {
-    walk(fn, (node) => {
-      if (node.type !== "CallExpression") return;
-      if (node.callee?.type !== "MemberExpression") return;
-      if (node.callee.property?.name !== "filter" && node.callee.property?.value !== "filter")
-        return;
-      if (node.arguments?.length !== 1) return;
+    // Already patched
+    if (exprSrc === "!0") return;
 
-      const cb = node.arguments[0];
-      const cbSrc = source.slice(cb.start, cb.end);
-
-      // Must contain .includes() — this is the allowlist pattern
-      // In minified code: X.includes(Y) or similar
-      if (!cbSrc.includes("includes")) return;
-
-      // Skip already-patched callbacks
-      if (cbSrc === "()=>!0") return;
-
-      // The filter is on a model array, and the callback checks if
-      // a model ID is in an allowlist via .includes().
-      // Replace with ()=>!0 to pass all models through.
-
-      patches.push({
-        id: "model_allowlist_filter_bypass",
-        start: cb.start,
-        end: cb.end,
-        replacement: "()=>!0",
-        original: cbSrc.slice(0, 60) + (cbSrc.length > 60 ? "..." : ""),
-      });
-    });
-  }
-
-  // Step 3: Also look for standalone filter patterns in model-related chunks
-  // Pattern: array.filter(callback) where the callback checks model validity
-  // and the array variable name contains "model" or "Model"
-  walk(ast, (node) => {
-    if (node.type !== "CallExpression") return;
-    if (node.callee?.type !== "MemberExpression") return;
-    if (node.callee.property?.name !== "filter") return;
-    if (node.arguments?.length !== 1) return;
-
-    // Check the object being filtered — does its source contain model references?
-    const objSrc = source.slice(node.callee.object.start, node.callee.object.end);
-    if (!objSrc.includes("model") && !objSrc.includes("Model")) return;
-
-    const cb = node.arguments[0];
-    const cbSrc = source.slice(cb.start, cb.end);
-    if (!cbSrc.includes("includes")) return;
-    if (cbSrc === "()=>!0") return;
-
-    // Avoid duplicate patches at same offset
-    if (patches.some((p) => p.start === cb.start)) return;
+    // Avoid duplicate
+    if (patches.some((p) => p.start === node.start)) return;
 
     patches.push({
-      id: "model_allowlist_filter_bypass",
-      start: cb.start,
-      end: cb.end,
-      replacement: "()=>!0",
-      original: cbSrc.slice(0, 60) + (cbSrc.length > 60 ? "..." : ""),
+      id: "hidden_model_show",
+      start: node.start,
+      end: node.end,
+      replacement: "!0",
+      original: exprSrc,
     });
   });
 
@@ -281,36 +233,28 @@ function locateTargets(platform) {
 
       const rules = [];
 
-      // Rule 1: authMethod + model context
-      if (src.includes("authMethod") && (src.includes("modelId") || src.includes("model_picker") || src.includes("ModelPicker") || src.includes("model_catalog"))) {
-        rules.push("auth");
+      // Rule 1: authMethod + !== "chatgpt" pattern
+      // Match files where authMethod is used with a !== "chatgpt" check
+      if (src.includes("authMethod") && src.includes("chatgpt")) {
+        // Verify there's a !== pattern (not just ===)
+        // Check for !==`chatgpt` or !=="chatgpt" or !== 'chatgpt'
+        if (src.includes("!==`chatgpt`") || src.includes('!=="chatgpt"') || src.includes("!== 'chatgpt'")) {
+          rules.push("auth");
+        }
       }
 
-      // Rule 2: remote_models gate
-      if (src.includes("770526561")) {
-        rules.push("gate");
+      // Rule 2: allowlist toggle (useHiddenModels pattern)
+      if (src.includes("useHiddenModels") && src.includes("amazonBedrock")) {
+        rules.push("allowlist");
       }
 
-      // Rule 3: model filter with includes
-      if (src.includes("model") && src.includes("filter") && src.includes("includes")) {
-        rules.push("filter");
+      // Rule 3: hidden model bypass
+      if (src.includes("availableModels") && src.includes(".hidden")) {
+        rules.push("hidden");
       }
 
       if (rules.length > 0) {
         targets.push({ platform: plat, path: fp, rules });
-      }
-    }
-
-    // Also check main process build dir for gate calls
-    const buildDir = path.join(SRC_DIR, plat, "_asar", ".vite", "build");
-    if (fs.existsSync(buildDir)) {
-      for (const f of fs.readdirSync(buildDir)) {
-        if (!f.endsWith(".js")) continue;
-        const fp = path.join(buildDir, f);
-        const src = fs.readFileSync(fp, "utf-8");
-        if (src.includes("770526561")) {
-          targets.push({ platform: plat, path: fp, rules: ["gate"] });
-        }
       }
     }
   }
@@ -332,7 +276,6 @@ function main() {
     return;
   }
 
-  // Deduplicate targets by path, merging rules
   const seen = new Map();
   for (const t of targets) {
     if (seen.has(t.path)) {
@@ -366,10 +309,10 @@ function main() {
     const patches = [];
     if (bundle.rules.includes("auth"))
       patches.push(...findModelAuthPatches(ast, source));
-    if (bundle.rules.includes("gate"))
-      patches.push(...findRemoteModelsGatePatches(ast, source));
-    if (bundle.rules.includes("filter"))
-      patches.push(...findModelFilterPatches(ast, source));
+    if (bundle.rules.includes("allowlist"))
+      patches.push(...findAllowlistTogglePatches(ast, source));
+    if (bundle.rules.includes("hidden"))
+      patches.push(...findHiddenModelPatches(ast, source));
 
     if (patches.length === 0) {
       console.log("   [ok] Already patched or no match");
